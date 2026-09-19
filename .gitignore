@@ -1,0 +1,13 @@
+# Never commit secrets
+.env
+*.env
+
+# The unpacked database is generated at runtime from data/pcards.db.gz
+data/pcards.db
+data/pcards.tmp
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
