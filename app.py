@@ -39,7 +39,7 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 # runtime, so the app keeps working as Google retires and adds models.
 MODEL_PREFERENCE = [
     os.environ.get("GEMINI_MODEL", "").strip(),
-    "gemini-2.5-flash",
+    "gemini-3.6-flash",
     "gemini-3.8-flash",
     "gemini-3.1-flash-lite",
     "gemini-2.5-flash-lite",
