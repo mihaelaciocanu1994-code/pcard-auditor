@@ -79,6 +79,7 @@ CREATE TABLE pcards (
 
 
 _index_checked = False
+_init_lock = threading.RLock()
 
 # Vendor-name normalisation: the same company appears under many spellings
 # (store numbers, branches). First matching rule wins.
@@ -107,9 +108,14 @@ def vendor_family(vendor):
 def ensure_indexes() -> None:
     """Create covering indexes once (makes GROUP BY Vendor queries much faster)."""
     global _index_checked
+    with _init_lock:
+        _ensure_indexes_locked()
+
+
+def _ensure_indexes_locked() -> None:
+    global _index_checked
     if _index_checked:
         return
-    _index_checked = True
     try:
         con = sqlite3.connect(str(DB_PATH), timeout=30)
         cols = [r[1] for r in con.execute("PRAGMA table_info(pcards)")]
@@ -124,10 +130,19 @@ def ensure_indexes() -> None:
         con.close()
     except Exception as exc:  # never block the app because of an optimisation
         app.logger.warning("Index creation skipped: %s", exc)
+    finally:
+        _index_checked = True
 
 
 def ensure_database() -> None:
     """Unpack the compressed database on first boot if it is not there yet."""
+    if _index_checked and DB_PATH.exists():
+        return
+    with _init_lock:
+        _ensure_database_locked()
+
+
+def _ensure_database_locked() -> None:
     if DB_PATH.exists():
         ensure_indexes()
         return
@@ -571,6 +586,12 @@ def healthz():
                        commit=(os.environ.get("RENDER_GIT_COMMIT") or "unknown")[:7])
     except Exception as exc:  # noqa: BLE001 - health check reports whatever broke
         return jsonify(status="error", detail=str(exc)), 500
+
+
+try:  # prepare the database once at start-up, before any request is served
+    ensure_database()
+except Exception as _exc:  # noqa: BLE001
+    app.logger.warning("Start-up database preparation failed: %s", _exc)
 
 
 if __name__ == "__main__":
