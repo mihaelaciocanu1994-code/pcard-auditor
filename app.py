@@ -77,9 +77,29 @@ CREATE TABLE pcards (
 """
 
 
+_index_checked = False
+
+
+def ensure_indexes() -> None:
+    """Create covering indexes once (makes GROUP BY Vendor queries much faster)."""
+    global _index_checked
+    if _index_checked:
+        return
+    _index_checked = True
+    try:
+        con = sqlite3.connect(str(DB_PATH), timeout=30)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_year_vendor_amt ON pcards(Year, Vendor, Amount)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_year_holder_amt ON pcards(Year, FullName, Amount)")
+        con.commit()
+        con.close()
+    except Exception as exc:  # never block the app because of an optimisation
+        app.logger.warning("Index creation skipped: %s", exc)
+
+
 def ensure_database() -> None:
     """Unpack the compressed database on first boot if it is not there yet."""
     if DB_PATH.exists():
+        ensure_indexes()
         return
     if not DB_GZ.exists():
         raise FileNotFoundError(
@@ -91,6 +111,7 @@ def ensure_database() -> None:
     with gzip.open(DB_GZ, "rb") as src, open(tmp, "wb") as dst:
         shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
     tmp.replace(DB_PATH)
+    ensure_indexes()
 
 
 def connect():
@@ -314,6 +335,15 @@ Rules:
 - Round money with ROUND(SUM(Amount), 2) and alias output columns in plain
   English, e.g. `AS "Total spent"`.
 - Always add an ORDER BY that matches the question, and a LIMIT of at most {MAX_ROWS}.
+- Vendor names are fragmented (the same company appears under many spellings,
+  e.g. 'Amazon.com', 'AMAZON MKTPLACE PMTS', 'WAL-MART #0137', 'WM SUPERCENTER #4241',
+  'TFS FISHER SCI ATL', 'STAPLES 00105288'). When the question asks about top
+  vendors or vendor totals, group by a normalised vendor family using a CASE
+  expression, e.g. CASE WHEN UPPER(Vendor) LIKE 'AMAZON%' OR UPPER(Vendor) LIKE 'AMZN%'
+  THEN 'Amazon' WHEN UPPER(Vendor) LIKE 'WAL-MART%' OR UPPER(Vendor) LIKE 'WM SUPERCENTER%'
+  THEN 'Walmart' WHEN UPPER(Vendor) LIKE '%FISHER%' THEN 'Fisher Scientific'
+  WHEN UPPER(Vendor) LIKE 'STAPLES%' THEN 'Staples' WHEN UPPER(Vendor) LIKE 'LOWES%'
+  THEN 'Lowes' ELSE Vendor END, and name the column "Vendor (grouped)".
 - Cardholder identity is FullName. AgencyName is the same for every row, so
   never filter on it.
 """
@@ -321,8 +351,12 @@ Rules:
 EXPLAIN_SYSTEM = """You are an internal audit assistant summarising a query result for an
 auditor at Oklahoma State University.
 
-Write 2-4 short sentences in plain English. Say what the result shows and what the
-auditor should look at next. Flagged rows are potential exceptions that need
+Write 2-4 short sentences in plain English. Quote ONLY numbers, names and ranks that
+appear in the rows you are given, and get the ranking order exactly right (say "first",
+"second" only when the rows show it). State the assumptions visible in the query (the
+year filter, purchases only when Amount > 0, grouping of vendor names). If the rows may
+be truncated or you only saw the first rows, say so. Give a specific next step tied to
+the data, not generic advice. Flagged rows are potential exceptions that need
 follow-up, never proof of fraud or of a violation, so never state that a violation
 or fraud occurred. No markdown headings, no bullet lists, no preamble.
 """
@@ -415,7 +449,7 @@ def api_ask():
 
     summary = None
     try:
-        preview = json.dumps({"columns": cols, "rows": rows[:15]}, default=str)[:4000]
+        preview = json.dumps({"columns": cols, "rows": rows[:25]}, default=str)[:6000]
         summary = gemini(
             f"Auditor's question: {question}\n\nQuery that was run:\n{sql}\n\n"
             f"Rows returned: {len(rows)}{'+ (truncated)' if truncated else ''}\n"
