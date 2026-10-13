@@ -73,11 +73,35 @@ CREATE TABLE pcards (
   PostedDate             TEXT,     -- original format 'M/D/YYYY 0:00:00'
   MCC                    TEXT,     -- merchant category code description, e.g. 'HARDWARE STORES'
   TxnDateISO             TEXT      -- TransactionDate as 'YYYY-MM-DD' (added for easy date maths)
+  ,VendorFamily          TEXT      -- cleaned company name; use it to group vendors
 );
 """
 
 
 _index_checked = False
+
+# Vendor-name normalisation: the same company appears under many spellings
+# (store numbers, branches). First matching rule wins.
+VENDOR_RULES = [
+    ("AMAZON", "Amazon"), ("AMZN", "Amazon"),
+    ("WAL-MART", "Walmart"), ("WM SUPERCENTER", "Walmart"), ("WALMART", "Walmart"),
+    ("TFS FISHER", "Fisher Scientific"), ("FISHERSCI", "Fisher Scientific"),
+    ("FISHER SCI", "Fisher Scientific"),
+    ("STAPLES", "Staples"), ("LOWES", "Lowes"), ("LOWE'S", "Lowes"),
+    ("VWR", "VWR International"), ("WINNELSO", "Winnelson"),
+    ("HOME DEPOT", "Home Depot"), ("OFFICE DEPOT", "Office Depot"),
+    ("BEST BUY", "Best Buy"), ("FEDEX", "FedEx"), ("SIGMA", "Sigma-Aldrich"),
+]
+
+
+def vendor_family(vendor):
+    v = vendor or ""
+    u = v.upper()
+    for key, name in VENDOR_RULES:
+        if key in u:
+            return name
+    # strip trailing store numbers such as ' #0137' or ' 00105288'
+    return re.sub(r"\s*#?\s*\d[\d\-]*\s*$", "", v).strip() or v
 
 
 def ensure_indexes() -> None:
@@ -88,6 +112,12 @@ def ensure_indexes() -> None:
     _index_checked = True
     try:
         con = sqlite3.connect(str(DB_PATH), timeout=30)
+        cols = [r[1] for r in con.execute("PRAGMA table_info(pcards)")]
+        if "VendorFamily" not in cols:
+            con.execute("ALTER TABLE pcards ADD COLUMN VendorFamily TEXT")
+            con.create_function("vendor_family", 1, vendor_family)
+            con.execute("UPDATE pcards SET VendorFamily = vendor_family(Vendor)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_year_family_amt ON pcards(Year, VendorFamily, Amount)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_year_vendor_amt ON pcards(Year, Vendor, Amount)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_year_holder_amt ON pcards(Year, FullName, Amount)")
         con.commit()
@@ -335,15 +365,11 @@ Rules:
 - Round money with ROUND(SUM(Amount), 2) and alias output columns in plain
   English, e.g. `AS "Total spent"`.
 - Always add an ORDER BY that matches the question, and a LIMIT of at most {MAX_ROWS}.
-- Vendor names are fragmented (the same company appears under many spellings,
-  e.g. 'Amazon.com', 'AMAZON MKTPLACE PMTS', 'WAL-MART #0137', 'WM SUPERCENTER #4241',
-  'TFS FISHER SCI ATL', 'STAPLES 00105288'). When the question asks about top
-  vendors or vendor totals, group by a normalised vendor family using a CASE
-  expression, e.g. CASE WHEN UPPER(Vendor) LIKE 'AMAZON%' OR UPPER(Vendor) LIKE 'AMZN%'
-  THEN 'Amazon' WHEN UPPER(Vendor) LIKE 'WAL-MART%' OR UPPER(Vendor) LIKE 'WM SUPERCENTER%'
-  THEN 'Walmart' WHEN UPPER(Vendor) LIKE '%FISHER%' THEN 'Fisher Scientific'
-  WHEN UPPER(Vendor) LIKE 'STAPLES%' THEN 'Staples' WHEN UPPER(Vendor) LIKE 'LOWES%'
-  THEN 'Lowes' ELSE Vendor END, and name the column "Vendor (grouped)".
+- Vendor names are fragmented: the same company appears under many spellings
+  (store numbers, branches). The column VendorFamily holds the cleaned company name
+  (e.g. 'Amazon', 'Walmart', 'Fisher Scientific'). For any question about top
+  vendors, vendor totals or vendor counts, GROUP BY VendorFamily (not Vendor) and
+  name the output column "Vendor". Use Vendor only to look at one exact spelling.
 - Cardholder identity is FullName. AgencyName is the same for every row, so
   never filter on it.
 """
