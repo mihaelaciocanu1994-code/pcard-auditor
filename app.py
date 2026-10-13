@@ -561,7 +561,14 @@ def api_export():
 def healthz():
     try:
         _, rows, _ = run_select("SELECT COUNT(*) FROM pcards")
-        return jsonify(status="ok", rows=rows[0][0], gemini_key=bool(GEMINI_API_KEY))
+        try:
+            run_select("SELECT VendorFamily FROM pcards LIMIT 1")
+            has_family = True
+        except sqlite3.Error:
+            has_family = False
+        return jsonify(status="ok", rows=rows[0][0], gemini_key=bool(GEMINI_API_KEY),
+                       vendor_family=has_family,
+                       commit=(os.environ.get("RENDER_GIT_COMMIT") or "unknown")[:7])
     except Exception as exc:  # noqa: BLE001 - health check reports whatever broke
         return jsonify(status="error", detail=str(exc)), 500
 
