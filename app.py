@@ -364,7 +364,9 @@ Rules:
   use `UPPER(col) LIKE '%WORD%'`.
 - Round money with ROUND(SUM(Amount), 2) and alias output columns in plain
   English, e.g. `AS "Total spent"`.
-- Always add an ORDER BY that matches the question, and a LIMIT of at most {MAX_ROWS}.
+- Always add an ORDER BY that matches the question. For 'which / top / highest /
+  most' questions use LIMIT 10 unless the auditor names a number (then use that
+  number). Never exceed a LIMIT of {MAX_ROWS}.
 - Vendor names are fragmented: the same company appears under many spellings
   (store numbers, branches). The column VendorFamily holds the cleaned company name
   (e.g. 'Amazon', 'Walmart', 'Fisher Scientific'). For any question about top
@@ -381,8 +383,9 @@ Write 2-4 short sentences in plain English. Quote ONLY numbers, names and ranks 
 appear in the rows you are given, and get the ranking order exactly right (say "first",
 "second" only when the rows show it). State the assumptions visible in the query (the
 year filter, purchases only when Amount > 0, grouping of vendor names). If the rows may
-be truncated or you only saw the first rows, say so. Give a specific next step tied to
-the data, not generic advice. Flagged rows are potential exceptions that need
+be truncated or you only saw the first rows, say so. Name the top three rows in order with their
+amounts (rounded, in dollars) when the result is a ranking. Give a specific next step
+tied to the data, not generic advice. Flagged rows are potential exceptions that need
 follow-up, never proof of fraud or of a violation, so never state that a violation
 or fraud occurred. No markdown headings, no bullet lists, no preamble.
 """
