@@ -177,7 +177,9 @@ _model_cache = {"name": None}
 
 
 class GeminiError(Exception):
-    pass
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status  # HTTP status from Google, or None for network errors
 
 
 def _http_json(url, payload=None, timeout=QUERY_TIMEOUT_S):
@@ -194,63 +196,103 @@ def _http_json(url, payload=None, timeout=QUERY_TIMEOUT_S):
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:400]
         if exc.code in (401, 403):
-            raise GeminiError("Gemini rejected the API key. Check GEMINI_API_KEY.") from exc
+            raise GeminiError("Gemini rejected the API key. Check GEMINI_API_KEY.", exc.code) from exc
         if exc.code == 429:
-            raise GeminiError("Gemini rate limit reached. Wait a moment and ask again.") from exc
-        raise GeminiError(f"Gemini returned HTTP {exc.code}: {detail}") from exc
+            raise GeminiError("Gemini rate limit reached. Wait a moment and ask again.", 429) from exc
+        raise GeminiError(f"Gemini returned HTTP {exc.code}: {detail}", exc.code) from exc
     except urllib.error.URLError as exc:
         raise GeminiError(f"Could not reach Gemini: {exc.reason}") from exc
 
 
-def pick_model() -> str:
-    """Choose a model this API key can actually call, then remember it."""
+def _usable_models():
+    """Models this key can call with generateContent (looked up once, then cached)."""
+    if "usable" not in _model_cache:
+        try:
+            listing = _http_json(f"{GEMINI_API_BASE}/models?pageSize=200", timeout=15)
+            _model_cache["usable"] = {
+                m["name"].split("/")[-1]
+                for m in listing.get("models", [])
+                if "generateContent" in m.get("supportedGenerationMethods", [])
+            }
+        except GeminiError:
+            return set()  # do not cache a failed lookup; try again next time
+    return _model_cache["usable"]
+
+
+def model_candidates(limit=5):
+    """Models to try, best first: the last one that worked, then the preference list,
+    then any other Flash model the key can use."""
+    usable = _usable_models()
+    ordered = []
     if _model_cache["name"]:
-        return _model_cache["name"]
-    wanted = [m for m in MODEL_PREFERENCE if m]
-    try:
-        listing = _http_json(f"{GEMINI_API_BASE}/models?pageSize=200", timeout=15)
-        usable = {
-            m["name"].split("/")[-1]
-            for m in listing.get("models", [])
-            if "generateContent" in m.get("supportedGenerationMethods", [])
-        }
-    except GeminiError:
-        usable = set()
-    for name in wanted:
-        if not usable or name in usable:
-            _model_cache["name"] = name
-            return name
-    flash = sorted(n for n in usable if "flash" in n and "tts" not in n and "image" not in n)
-    if flash:
-        _model_cache["name"] = flash[0]
-        return flash[0]
-    raise GeminiError("No Gemini model on this key supports generateContent.")
+        ordered.append(_model_cache["name"])
+    for name in (m for m in MODEL_PREFERENCE if m):
+        if (not usable or name in usable) and name not in ordered:
+            ordered.append(name)
+    for name in sorted(usable):
+        if "flash" in name and "tts" not in name and "image" not in name and name not in ordered:
+            ordered.append(name)
+    if not ordered:
+        raise GeminiError("No Gemini model on this key supports generateContent.")
+    return ordered[:limit]
 
 
-def gemini(prompt: str, system: str = "", temperature: float = 0.0) -> str:
+def _is_busy(exc):
+    """True for temporary problems (overloaded, rate limited, network blip)."""
+    return exc.status in (429, 500, 502, 503, 504) or exc.status is None
+
+
+def gemini(prompt: str, system: str = "", temperature: float = 0.0, patient: bool = True) -> str:
+    """Call Gemini. Retries when Google is overloaded (HTTP 503/429) and falls back
+    to the next model, so a busy model never reaches the user as a raw error."""
     if not GEMINI_API_KEY:
         raise GeminiError(
             "No Gemini API key is configured. Set GEMINI_API_KEY in the environment "
             "and restart the app."
         )
-    model = pick_model()
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": temperature, "maxOutputTokens": 1200},
     }
     if system:
         payload["systemInstruction"] = {"parts": [{"text": system}]}
-    data = _http_json(f"{GEMINI_API_BASE}/models/{model}:generateContent", payload)
 
-    candidates = data.get("candidates") or []
-    if not candidates:
-        blocked = (data.get("promptFeedback") or {}).get("blockReason")
-        raise GeminiError(f"Gemini returned no answer{f' ({blocked})' if blocked else ''}.")
-    parts = (candidates[0].get("content") or {}).get("parts") or []
-    text = "".join(p.get("text", "") for p in parts).strip()
-    if not text:
-        raise GeminiError("Gemini returned an empty answer. Try rewording the question.")
-    return text
+    attempts_per_model = 3 if patient else 1
+    deadline = time.time() + (70 if patient else 20)  # stay inside the gunicorn timeout
+    last_busy = None
+    last_error = None
+    for model in model_candidates():
+        for attempt in range(attempts_per_model):
+            if time.time() > deadline:
+                break
+            try:
+                data = _http_json(f"{GEMINI_API_BASE}/models/{model}:generateContent", payload)
+            except GeminiError as exc:
+                last_error = exc
+                if exc.status in (401, 403):
+                    raise  # a bad key will not get better by retrying
+                if _is_busy(exc):
+                    last_busy = exc
+                    time.sleep(1.5 * (attempt + 1))  # 1.5s, 3s, then try the next model
+                    continue
+                break  # e.g. 404 retired model, 400: move on to the next model
+            candidates = data.get("candidates") or []
+            if not candidates:
+                blocked = (data.get("promptFeedback") or {}).get("blockReason")
+                raise GeminiError(f"Gemini returned no answer{f' ({blocked})' if blocked else ''}.")
+            parts = (candidates[0].get("content") or {}).get("parts") or []
+            text = "".join(p.get("text", "") for p in parts).strip()
+            if not text:
+                raise GeminiError("Gemini returned an empty answer. Try rewording the question.")
+            _model_cache["name"] = model  # remember what worked
+            return text
+    if last_busy is not None:
+        raise GeminiError(
+            "Gemini is very busy right now (Google reported high demand). "
+            "Please wait a minute and ask again.",
+            503,
+        )
+    raise last_error or GeminiError("Gemini could not answer.")
 
 
 SQL_SYSTEM = f"""You translate an internal auditor's question into ONE SQLite SELECT query.
@@ -380,6 +422,7 @@ def api_ask():
             f"First rows as JSON:\n{preview}\n\nSummary:",
             EXPLAIN_SYSTEM,
             temperature=0.2,
+            patient=False,
         )
     except GeminiError:
         pass  # the table is the answer; the summary is a bonus
